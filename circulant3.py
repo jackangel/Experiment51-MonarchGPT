@@ -116,8 +116,6 @@ def hbs_layer_factory(dim_in, dim_out):
     if dim_in == dim_out: return HierarchicalBlockShuffleLayer(dim=dim_in)
     return nn.Linear(dim_in, dim_out)
 
-# --- 2. Stabilized Hybrid Attention ---
-# --- 2. Stabilized Hybrid Attention (Float32 Core) ---
 class HybridFocusAttention(nn.Module):
     def __init__(self, n_embd, n_head):
         super().__init__()
@@ -143,24 +141,23 @@ class HybridFocusAttention(nn.Module):
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         # --- BRANCH A: FUZZY FOCUS (Forced Float32) ---
-        # We disable autocast to force this block to run in FP32.
-        # This prevents the Q*K accumulator from hitting the 65,504 overflow limit.
         with torch.amp.autocast('cuda', enabled=False):
             # 1. Cast inputs to FP32 manually
             q_f32 = q.float()
             k_f32 = k.float()
             v_f32 = v.float()
             
+            # Lower scaling factor slightly to prevent massive growth
             scale = 1.0 / math.sqrt(self.head_dim)
             
-            # 2. Compute in FP32
             Q_lin = F.softplus(q_f32 * scale) + 0.5
             K_lin = F.softplus(k_f32 * scale) + 0.5
             
             k_cumsum = torch.cumsum(K_lin, dim=2)
             
-            # Epsilon 1e-4 is fine here because we are in FP32
-            denominator = torch.einsum('bhtd,bhtd->bht', Q_lin, k_cumsum).unsqueeze(-1) + 1e-4
+            # Robust denominator to prevent division by zero or tiny numbers
+            denominator = torch.einsum('bhtd,bhtd->bht', Q_lin, k_cumsum).unsqueeze(-1)
+            denominator = torch.clamp(denominator, min=1e-4) 
             
             kv = torch.einsum('bhtd,bhte->bhtde', K_lin, v_f32)
             kv_cumsum = torch.cumsum(kv, dim=2)
@@ -168,23 +165,28 @@ class HybridFocusAttention(nn.Module):
             
             y_fuzzy = numerator / denominator
             
-            # 3. Cast back to original dtype (FP16) for the rest of the network
+            # --- CRITICAL FIX START ---
+            # 1. Check for NaNs/Infs generated during division
+            y_fuzzy = torch.nan_to_num(y_fuzzy, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            # 2. Clamp values to fit within FP16 range BEFORE casting
+            # FP16 max is ~65500. We clamp conservatively because LayerNorm follows.
+            y_fuzzy = torch.clamp(y_fuzzy, min=-50.0, max=50.0)
+            # --- CRITICAL FIX END ---
+            
+            # 3. Cast back safely
             y_fuzzy = y_fuzzy.to(x.dtype)
 
-        # Normalize the fuzzy output to keep it compatible with Sharp attention
+        # Normalize 
         y_fuzzy = self.lin_norm(y_fuzzy.transpose(1, 2)).transpose(1, 2)
 
         # --- BRANCH B: SHARP FOCUS ---
-        # Flash Attention handles mixed precision internally
         y_sharp = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         alpha = torch.sigmoid(self.focus_gate)
         
-        # Fallback Safety (Should not trigger with FP32, but good to keep)
-        if torch.isnan(y_fuzzy).any():
-            y_combined = y_sharp
-        else:
-            y_combined = (alpha * y_sharp) + ((1.0 - alpha) * y_fuzzy)
+        # Robust recombination
+        y_combined = (alpha * y_sharp) + ((1.0 - alpha) * y_fuzzy)
         
         y = y_combined.transpose(1, 2).contiguous().view(B, T, C)
         return self.c_proj(y)
