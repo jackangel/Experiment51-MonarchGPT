@@ -7,6 +7,7 @@ import sys
 import os
 import random
 import tiktoken 
+import warnings
 
 # --- Hyperparameters ---
 batch_size = 6
@@ -38,6 +39,7 @@ parquet_folder = r"D:\Datasets"
 parquet_text_col = "text"          
 
 torch.set_float32_matmul_precision('high')
+warnings.filterwarnings("ignore", category=FutureWarning) 
 
 # --- 0. RoPE ---
 class RotaryEmbedding(nn.Module):
@@ -64,26 +66,29 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     sin = sin[..., :q.shape[2], :]
     return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
 
-# --- 1. Efficient HBSL Layer ---
+# --- 1. Robust HBSL Layer (Pre-Norm + Float32 Core) ---
 class HierarchicalBlockShuffleLayer(nn.Module):
-    def __init__(self, dim, block_size=16, **kwargs):
+    def __init__(self, dim, block_size=16):
         super().__init__()
         self.dim = dim
         self.block_size = block_size
         self.num_groups = (dim + block_size - 1) // block_size
         self.padded_dim_groups = self.num_groups * self.block_size
+        
+        # Internal Norms to prevent signal explosion/decay
+        self.pre_norm = nn.LayerNorm(dim)
+        
         self.block_weights = nn.Parameter(torch.randn(self.num_groups, self.block_size, self.block_size))
-        # Scaled Init to prevent signal explosion
-        nn.init.kaiming_uniform_(self.block_weights, a=math.sqrt(5))
-        self.block_weights.data *= 0.1 
+        nn.init.orthogonal_(self.block_weights)
+        self.block_weights.data *= 0.5 # Gentle init
         
         sqrt_dim_ceil = math.ceil(math.sqrt(dim))
         self.padded_dim_monarch = sqrt_dim_ceil * sqrt_dim_ceil
         self.sqrt_dim = sqrt_dim_ceil
         self.W_row = nn.Parameter(torch.randn(self.sqrt_dim, self.sqrt_dim))
         self.W_col = nn.Parameter(torch.randn(self.sqrt_dim, self.sqrt_dim))
-        nn.init.kaiming_uniform_(self.W_row, a=math.sqrt(5))
-        nn.init.kaiming_uniform_(self.W_col, a=math.sqrt(5))
+        nn.init.orthogonal_(self.W_row)
+        nn.init.orthogonal_(self.W_col)
         self.W_row.data *= 0.1
         self.W_col.data *= 0.1
         
@@ -91,31 +96,45 @@ class HierarchicalBlockShuffleLayer(nn.Module):
         self.bias = nn.Parameter(torch.zeros(dim))
 
     def forward(self, x):
+        # 1. Pre-Norm: Forces input to be stable range [-3, 3]
+        x_norm = self.pre_norm(x)
         orig_shape = x.shape
-        x = x.reshape(-1, self.dim)
         
-        pad_amt = self.padded_dim_groups - self.dim
-        x_padded = F.pad(x, (0, pad_amt)) if pad_amt > 0 else x
-        x_grouped = x_padded.reshape(-1, self.num_groups, self.block_size)
-        y_perm = torch.bmm(x_grouped.permute(1, 0, 2), self.block_weights)
-        y_mixed = y_perm.permute(1, 0, 2).reshape(-1, self.padded_dim_groups)
-        if pad_amt > 0: y_mixed = y_mixed[..., :self.dim]
-        block_out = torch.flip(y_mixed, dims=[-1])
+        # 2. Force FP32 for Matrix Math
+        with torch.amp.autocast('cuda', enabled=False):
+            x_f32 = x_norm.float()
+            x_flat = x_f32.reshape(-1, self.dim)
+            
+            # Branch 1: Block Shuffle
+            pad_amt = self.padded_dim_groups - self.dim
+            x_padded = F.pad(x_flat, (0, pad_amt)) if pad_amt > 0 else x_flat
+            x_grouped = x_padded.reshape(-1, self.num_groups, self.block_size)
+            
+            w_block_f32 = self.block_weights.float()
+            y_perm = torch.bmm(x_grouped.permute(1, 0, 2), w_block_f32)
+            y_mixed = y_perm.permute(1, 0, 2).reshape(-1, self.padded_dim_groups)
+            if pad_amt > 0: y_mixed = y_mixed[..., :self.dim]
+            block_out = torch.flip(y_mixed, dims=[-1])
 
-        pad_mon = self.padded_dim_monarch - self.dim
-        x_mon = F.pad(x, (0, pad_mon)) if pad_mon > 0 else x
-        x_grid = x_mon.reshape(-1, self.sqrt_dim, self.sqrt_dim)
-        z_grid = torch.matmul(torch.matmul(x_grid, self.W_col), self.W_row.t())
-        monarch_out = z_grid.reshape(-1, self.padded_dim_monarch)
-        if pad_mon > 0: monarch_out = monarch_out[..., :self.dim]
-        
-        out = block_out + self.alpha * monarch_out + self.bias
-        return (out * 0.7071).reshape(orig_shape)
+            # Branch 2: Monarch
+            pad_mon = self.padded_dim_monarch - self.dim
+            x_mon = F.pad(x_flat, (0, pad_mon)) if pad_mon > 0 else x_flat
+            x_grid = x_mon.reshape(-1, self.sqrt_dim, self.sqrt_dim)
+            z_grid = torch.matmul(torch.matmul(x_grid, self.W_col.float()), self.W_row.float().t())
+            monarch_out = z_grid.reshape(-1, self.padded_dim_monarch)
+            if pad_mon > 0: monarch_out = monarch_out[..., :self.dim]
+            
+            # Recombine
+            out = block_out + self.alpha.float() * monarch_out + self.bias.float()
+            out = out.to(x.dtype) # Cast back to FP16/BF16
+            
+        return out.reshape(orig_shape)
 
 def hbs_layer_factory(dim_in, dim_out):
     if dim_in == dim_out: return HierarchicalBlockShuffleLayer(dim=dim_in)
     return nn.Linear(dim_in, dim_out)
 
+# --- 2. Stabilized Hybrid Attention (Safe Linear) ---
 class HybridFocusAttention(nn.Module):
     def __init__(self, n_embd, n_head):
         super().__init__()
@@ -125,7 +144,10 @@ class HybridFocusAttention(nn.Module):
         self.n_embd = n_embd
         self.head_dim = n_embd // n_head
         self.focus_gate = nn.Parameter(torch.tensor(0.0)) 
-        self.lin_norm = nn.LayerNorm(self.head_dim)
+        
+        # Norms for stability
+        self.attn_norm = nn.LayerNorm(self.head_dim)
+        self.out_norm = nn.LayerNorm(n_embd)
 
     def forward(self, x, rotary_emb=None):
         B, T, C = x.size()
@@ -140,58 +162,47 @@ class HybridFocusAttention(nn.Module):
             cos, sin = rotary_emb(q, seq_len=T)
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # --- BRANCH A: FUZZY FOCUS (Forced Float32) ---
+        # --- BRANCH A: SAFE LINEAR ATTENTION ---
+        # Using ELU+1 kernel (Katharopoulos et al.) which is always positive
+        # This removes the instability of "Fuzzy" Softplus Cumsum
         with torch.amp.autocast('cuda', enabled=False):
-            # 1. Cast inputs to FP32 manually
             q_f32 = q.float()
             k_f32 = k.float()
             v_f32 = v.float()
             
-            # Lower scaling factor slightly to prevent massive growth
+            # Activation: x > 0. Non-negative guarantees stability.
             scale = 1.0 / math.sqrt(self.head_dim)
+            Q_prime = F.elu(q_f32 * scale) + 1.0
+            K_prime = F.elu(k_f32 * scale) + 1.0
             
-            Q_lin = F.softplus(q_f32 * scale) + 0.5
-            K_lin = F.softplus(k_f32 * scale) + 0.5
+            # Normalizer for stability
+            KV = torch.einsum('bhtd,bhte->bhtde', K_prime, v_f32)
+            KV_cumsum = torch.cumsum(KV, dim=2)
             
-            k_cumsum = torch.cumsum(K_lin, dim=2)
+            K_cumsum = torch.cumsum(K_prime, dim=2)
             
-            # Robust denominator to prevent division by zero or tiny numbers
-            denominator = torch.einsum('bhtd,bhtd->bht', Q_lin, k_cumsum).unsqueeze(-1)
-            denominator = torch.clamp(denominator, min=1e-4) 
+            numerator = torch.einsum('bhtd,bhtde->bhte', Q_prime, KV_cumsum)
+            denominator = torch.einsum('bhtd,bhtd->bht', Q_prime, K_cumsum).unsqueeze(-1)
             
-            kv = torch.einsum('bhtd,bhte->bhtde', K_lin, v_f32)
-            kv_cumsum = torch.cumsum(kv, dim=2)
-            numerator = torch.einsum('bhtd,bhtde->bhte', Q_lin, kv_cumsum)
-            
-            y_fuzzy = numerator / denominator
-            
-            # --- CRITICAL FIX START ---
-            # 1. Check for NaNs/Infs generated during division
-            y_fuzzy = torch.nan_to_num(y_fuzzy, nan=0.0, posinf=0.0, neginf=0.0)
-            
-            # 2. Clamp values to fit within FP16 range BEFORE casting
-            # FP16 max is ~65500. We clamp conservatively because LayerNorm follows.
-            y_fuzzy = torch.clamp(y_fuzzy, min=-50.0, max=50.0)
-            # --- CRITICAL FIX END ---
-            
-            # 3. Cast back safely
-            y_fuzzy = y_fuzzy.to(x.dtype)
+            # Epsilon is critical here
+            y_linear = numerator / (denominator + 1e-4)
+            y_linear = y_linear.to(x.dtype)
 
-        # Normalize 
-        y_fuzzy = self.lin_norm(y_fuzzy.transpose(1, 2)).transpose(1, 2)
+        y_linear = self.attn_norm(y_linear.transpose(1, 2)).transpose(1, 2)
 
         # --- BRANCH B: SHARP FOCUS ---
         y_sharp = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-
-        alpha = torch.sigmoid(self.focus_gate)
         
-        # Robust recombination
-        y_combined = (alpha * y_sharp) + ((1.0 - alpha) * y_fuzzy)
+        # Gating
+        alpha = torch.sigmoid(self.focus_gate)
+        y_combined = (alpha * y_sharp) + ((1.0 - alpha) * y_linear)
         
         y = y_combined.transpose(1, 2).contiguous().view(B, T, C)
-        return self.c_proj(y)
+        
+        # Output Norm to reset scale before projection
+        return self.c_proj(self.out_norm(y))
 
-# --- 3. Firewalled EMA VQ ---
+# --- 3. VQ with Input Squash ---
 class EMAVectorQuantizer(nn.Module):
     def __init__(self, num_buckets, embedding_dim, num_heads, commitment_cost, decay=0.99, epsilon=1e-5):
         super().__init__()
@@ -206,15 +217,19 @@ class EMAVectorQuantizer(nn.Module):
         self.register_buffer('cluster_size', torch.zeros(num_heads, num_buckets))
         self.register_buffer('embed_avg', self.embeddings.clone())
         
+        # Learnable input normalization
+        self.in_norm = nn.LayerNorm(embedding_dim)
+        
         nn.init.orthogonal_(self.embeddings)
         self.embeddings.data = F.normalize(self.embeddings.data, p=2, dim=-1)
 
     def forward(self, inputs):
-        # FIX 3: CLAMP INPUTS
-        # Prevent "Fireballs" (values > 50) from blowing up MSE loss gradient
-        inputs = torch.clamp(inputs, min=-50.0, max=50.0)
+        # 1. Normalize Inputs immediately (Safe Zone)
+        inputs = self.in_norm(inputs)
+        
+        # 2. Hard Tanh Limit - prevents "fireballs"
+        inputs = torch.tanh(inputs / 5.0) * 5.0 
 
-        # FIX 4: FIREWALL
         if not torch.isfinite(inputs).all():
             return inputs, torch.tensor(0.0, device=inputs.device, requires_grad=True), 0
 
@@ -232,29 +247,26 @@ class EMAVectorQuantizer(nn.Module):
         quantized = quantized.view(B, T, D)
         
         if self.training:
-            with torch.no_grad():
+             with torch.no_grad():
                 flat_input_no_grad = flat_input.detach()
-                if torch.isfinite(flat_input_no_grad).all():
-                    encodings = F.one_hot(encoding_indices, self.num_buckets).float()
-                    avg_usage = encodings.sum(dim=0)
-                    self.cluster_size.data.mul_(self.decay).add_(avg_usage, alpha=1 - self.decay)
-                    
-                    embed_sum = torch.einsum('nhk,nhd->hkd', encodings, flat_input_no_grad)
-                    self.embed_avg.data.mul_(self.decay).add_(embed_sum, alpha=1 - self.decay)
-                    
-                    n = self.cluster_size.sum(dim=1, keepdim=True)
-                    cluster_size_smoothed = (self.cluster_size + self.epsilon) / (n + self.num_buckets * self.epsilon) * n
-                    embed_normalized = self.embed_avg / cluster_size_smoothed.unsqueeze(-1)
-                    self.embeddings.data.copy_(F.normalize(embed_normalized, p=2, dim=-1, eps=self.epsilon))
-                    
-                    for h in range(self.num_heads):
-                        dead_indices = torch.nonzero(self.cluster_size[h] < 0.5).squeeze(-1)
-                        if dead_indices.numel() > 0:
-                             rand_idx = torch.randint(0, flat_input.size(0), (dead_indices.numel(),), device=inputs.device)
-                             replacements = flat_input_no_grad[rand_idx, h, :]
-                             self.embeddings.data[h, dead_indices, :] = F.normalize(replacements, p=2, dim=-1)
-                             self.cluster_size.data[h, dead_indices] = 1.0
-                             self.embed_avg.data[h, dead_indices, :] = replacements
+                encodings = F.one_hot(encoding_indices, self.num_buckets).float()
+                avg_usage = encodings.sum(dim=0)
+                self.cluster_size.data.mul_(self.decay).add_(avg_usage, alpha=1 - self.decay)
+                embed_sum = torch.einsum('nhk,nhd->hkd', encodings, flat_input_no_grad)
+                self.embed_avg.data.mul_(self.decay).add_(embed_sum, alpha=1 - self.decay)
+                n = self.cluster_size.sum(dim=1, keepdim=True)
+                cluster_size_smoothed = (self.cluster_size + self.epsilon) / (n + self.num_buckets * self.epsilon) * n
+                embed_normalized = self.embed_avg / cluster_size_smoothed.unsqueeze(-1)
+                self.embeddings.data.copy_(F.normalize(embed_normalized, p=2, dim=-1, eps=self.epsilon))
+                
+                # Random Restart for Dead Codebooks
+                for h in range(self.num_heads):
+                    dead_indices = torch.nonzero(self.cluster_size[h] < 0.1).squeeze(-1)
+                    if dead_indices.numel() > 0:
+                        rand_idx = torch.randint(0, flat_input.size(0), (dead_indices.numel(),), device=inputs.device)
+                        self.embeddings.data[h, dead_indices, :] = flat_input_no_grad[rand_idx, h, :]
+                        self.cluster_size.data[h, dead_indices] = 1.0
+                        self.embed_avg.data[h, dead_indices, :] = flat_input_no_grad[rand_idx, h, :]
 
         e_latent_loss = F.mse_loss(quantized.detach(), inputs_norm)
         
@@ -262,7 +274,7 @@ class EMAVectorQuantizer(nn.Module):
             encodings = F.one_hot(encoding_indices, self.num_buckets).float()
             avg_probs = encodings.mean(dim=0) 
             perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10), dim=-1)).mean()
-            entropy_loss = -0.05 * perplexity
+            entropy_loss = -0.1 * perplexity 
         else:
             entropy_loss = torch.tensor(0.0, device=inputs.device)
 
@@ -300,6 +312,7 @@ class SparseMoE(nn.Module):
         x_flat = x.view(-1, C)
         
         logits = self.gate(x_flat)
+        # Clamp logits to prevent Softmax saturation
         logits = torch.clamp(logits, min=-20.0, max=20.0)
         
         weights, indices = torch.topk(logits, self.top_k, dim=-1)
@@ -404,7 +417,6 @@ class HierarchicalGPT(nn.Module):
         self.vq_layer = EMAVectorQuantizer(num_buckets, dim_manager, num_heads, commitment_cost)
         self.ctx_proj = nn.Linear(dim_manager, dim_worker)
         
-        # Scaling init (GPT-2 style) for projections
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -535,8 +547,6 @@ def get_balanced_file_list(root_folder):
     return files
 
 if __name__ == '__main__':
-    import warnings
-    warnings.filterwarnings("ignore", category=FutureWarning) 
     concurrent_file_load = 3   
     shuffle_block_size = 2048 
     GRAD_ACCUM_STEPS = 8      
@@ -548,10 +558,12 @@ if __name__ == '__main__':
         parquet_files = get_balanced_file_list(parquet_folder)
     vocab_size = enc.n_vocab 
 
-    print(f"Running Robust Hierarchical GPT (Fixed Loop & Math) on {device}")
+    print(f"Running STABILIZED Hierarchical GPT (Pre-Norm + Safe Linear) on {device}")
     
     model = HierarchicalGPT(vocab_size).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    
+    # Initialize Scaler
     scaler = torch.amp.GradScaler() 
     
     ckpt_path = 'ckpt_robust.pt'
@@ -564,7 +576,15 @@ if __name__ == '__main__':
             model.load_state_dict(checkpoint['model'])
             optimizer.load_state_dict(checkpoint['optimizer'])
             current_iter = checkpoint['iter']
-        except: print("Resuming failed. Starting fresh.")
+            
+            # --- MANDATORY RESET ---
+            # We assume the previous scaler state is potentially corrupted/dead.
+            # Start fresh to ensure training actually moves.
+            scaler = torch.amp.GradScaler() 
+            print("!!! Scaler force-reset to default (65536) to prevent dead training !!!")
+            
+        except Exception as e: 
+            print(f"Resuming failed: {e}. Starting fresh.")
 
     iter_start = time.time()
     file_chunks = [parquet_files[i:i + concurrent_file_load] for i in range(0, len(parquet_files), concurrent_file_load)]
@@ -598,15 +618,20 @@ if __name__ == '__main__':
                 logits, loss, vq_count, _ = model(xb, yb, use_cache=True)
                 loss = loss / GRAD_ACCUM_STEPS 
             
+            # Scale Loss
             scaler.scale(loss).backward()
             
             if (step + 1) % GRAD_ACCUM_STEPS == 0:
                 scaler.unscale_(optimizer)
+                
+                # Global Gradient Clipping (Stabilizer)
+                # This replaces the aggressive manual hooks
                 norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                
                 lr = get_lr(current_iter)
                 for param_group in optimizer.param_groups: param_group['lr'] = lr
                 
-                # Let Scaler handle NaN/Skipping
+                # Scaler step will skip if NaNs are found after unscaling (safe)
                 scaler.step(optimizer)
                 scaler.update()
                 
