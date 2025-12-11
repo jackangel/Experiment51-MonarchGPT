@@ -570,21 +570,20 @@ if __name__ == '__main__':
     current_iter = 0 
     
     if os.path.exists(ckpt_path):
-        print(f"Resuming from {ckpt_path}...")
-        try:
-            checkpoint = torch.load(ckpt_path, map_location=device)
-            model.load_state_dict(checkpoint['model'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            current_iter = checkpoint['iter']
-            
-            # --- MANDATORY RESET ---
-            # We assume the previous scaler state is potentially corrupted/dead.
-            # Start fresh to ensure training actually moves.
-            scaler = torch.amp.GradScaler() 
-            print("!!! Scaler force-reset to default (65536) to prevent dead training !!!")
-            
-        except Exception as e: 
-            print(f"Resuming failed: {e}. Starting fresh.")
+            print(f"Resuming from {ckpt_path}...")
+            try:
+                # RENAME 'checkpoint' TO 'ckpt_data'
+                ckpt_data = torch.load(ckpt_path, map_location=device)
+                
+                model.load_state_dict(ckpt_data['model'])
+                optimizer.load_state_dict(ckpt_data['optimizer'])
+                current_iter = ckpt_data['iter']
+                
+                scaler = torch.amp.GradScaler() 
+                print("!!! Scaler force-reset to default (65536) to prevent dead training !!!")
+                
+            except Exception as e: 
+                print(f"Resuming failed: {e}. Starting fresh.")
 
     iter_start = time.time()
     file_chunks = [parquet_files[i:i + concurrent_file_load] for i in range(0, len(parquet_files), concurrent_file_load)]
@@ -656,7 +655,7 @@ if __name__ == '__main__':
                     except: pass
                     model.train()
             
-        checkpoint = {'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'iter': current_iter}
-        torch.save(checkpoint, ckpt_path)
+        save_data = {'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'iter': current_iter}
+        torch.save(save_data, ckpt_path)
         del train_data
         torch.cuda.empty_cache()
